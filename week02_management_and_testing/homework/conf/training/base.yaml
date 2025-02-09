@@ -1,0 +1,5 @@
+num_epochs: 100
+batch_size: 128
+num_workers: 4
+num_samples: 8
+samples_dir: "./samples"

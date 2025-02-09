@@ -1,0 +1,4 @@
+name: "unet"
+hidden_size: 128
+input_channels: 3
+output_channels: 3

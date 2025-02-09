@@ -1,0 +1,2 @@
+scheduler: [1e-4, 0.02]
+num_timesteps: 1000

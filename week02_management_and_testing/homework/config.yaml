@@ -1,0 +1,41 @@
+dataset:
+  name: CIFAR-10
+  path: ./data/cifar10
+  image_size:
+  - 3
+  - 32
+  - 32
+  mean:
+  - 0.5
+  - 0.5
+  - 0.5
+  std:
+  - 0.5
+  - 0.5
+  - 0.5
+  augmentation: true
+model:
+  name: unet
+  hidden_size: 128
+  input_channels: 3
+  output_channels: 3
+training:
+  num_epochs: 5
+  batch_size: 128
+  num_workers: 4
+  num_samples: 8
+  samples_dir: ./samples
+optimizer:
+  name: sgd
+  lr: 0.0005
+  momentum: 0.9
+  weight_decay: 0.01
+diffusion:
+  scheduler:
+  - 0.0001
+  - 0.02
+  num_timesteps: 1000
+project:
+  name: EfDL-week02-homework
+  seed: 42
+  output_dir: outputs/${now:%Y-%m-%d_%H-%M-%S}

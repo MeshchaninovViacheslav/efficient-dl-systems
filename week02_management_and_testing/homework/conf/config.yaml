@@ -1,0 +1,11 @@
+defaults:
+  - dataset: cifar10
+  - model: unet
+  - training: base
+  - optimizer: adam
+  - diffusion: diffusion
+
+project:
+  name: "EfDL-week02-homework"
+  seed: 42
+  output_dir: "outputs/${now:%Y-%m-%d_%H-%M-%S}"  # Unique directory per run
