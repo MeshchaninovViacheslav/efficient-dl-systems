@@ -60,7 +60,7 @@ def get_train_data() -> torch.utils.data.DataLoader:
     )
 
     train_loader = torch.utils.data.DataLoader(
-        dataset=train_dataset, batch_size=128, shuffle=True, pin_memory=True, num_workers=4
+        dataset=train_dataset, batch_size=128, shuffle=True, pin_memory=True, num_workers=10
     )
 
     return train_loader

@@ -37,29 +37,28 @@ class Attention(nn.Module):
 
         self.heads = heads
         self.scale = dim_head ** (-0.5)
+        self.dropout = dropout
 
-        self.attend = nn.Softmax(dim=-1)
-        self.dropout = nn.Dropout(dropout)
+        self.qkv = nn.Linear(dim, inner_dim * 3, bias=False)
         self.norm = nn.LayerNorm(dim)
-        self.queries = nn.Linear(dim, inner_dim, bias=False)
-        self.keys = nn.Linear(dim, inner_dim, bias=False)
-        self.values = nn.Linear(dim, inner_dim, bias=False)
 
         self.to_out = nn.Sequential(nn.Linear(inner_dim, dim), nn.Dropout(dropout)) if project_out else nn.Identity()
 
     def forward(self, x):
-        q = self.queries(x)
-        k = self.keys(x)
-        v = self.values(x)
+        x = self.norm(x)
+        b, n, _ = x.shape
+        
+        # More efficient combined QKV projection
+        qkv = self.qkv(x).chunk(3, dim=-1)
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h=self.heads), qkv)
 
-        dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
-
-        attn = self.attend(dots)
-        attn = self.dropout(attn)
-
-        out = torch.matmul(attn, v)
-
-        return self.to_out(out)
+        output = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v,
+            dropout_p=self.dropout if self.training else 0.0,
+            is_causal=False
+        )
+        output = rearrange(output, 'b h n d -> b n (h d)')
+        return self.to_out(output)
 
 
 class Transformer(nn.Module):
@@ -92,7 +91,7 @@ class ViT(nn.Module):
         num_classes,
         depth,
         heads,
-        dim=255,
+        dim=256,
         pool="cls",
         channels=3,
         dim_head=64,

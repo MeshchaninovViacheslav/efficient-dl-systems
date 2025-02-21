@@ -6,7 +6,7 @@ from typing import Optional, Tuple
 
 import torch
 from torch import nn, Tensor
-from torch.nn import TransformerEncoder, TransformerEncoderLayer, functional as F
+from torch.nn import TransformerEncoder, functional as F
 from torch.nn.init import xavier_uniform_, constant_, xavier_normal_
 from torch.nn.modules.activation import MultiheadAttention
 from torch.nn.modules.dropout import Dropout
@@ -20,11 +20,12 @@ class TransformerModel(nn.Module):
         super().__init__()
         self.model_type = "Transformer"
         self.pos_encoder = PositionalEncoding(d_model, dropout)
-        encoder_layers = TransformerEncoderLayer(d_model, nhead, d_hid, dropout)
-        self.transformer_encoder = TransformerEncoder(encoder_layers, nlayers)
+        encoder_layers = nn.TransformerEncoderLayer(d_model, nhead, d_hid, dropout)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layers, nlayers)
         self.encoder = nn.Embedding(ntoken, d_model)
         self.d_model = d_model
         self.decoder = nn.Linear(d_model, ntoken)
+        self.nhead = nhead
 
         self.init_weights()
 
@@ -43,6 +44,11 @@ class TransformerModel(nn.Module):
         Returns:
             output Tensor of shape [seq_len, batch_size, ntoken]
         """
+        if src_mask.dim() == 3:
+            src_mask = src_mask.reshape(src_mask.size(0), 1, src_mask.size(1), src_mask.size(2))
+            src_mask = src_mask.repeat(1, self.nhead, 1, 1)
+            src_mask = src_mask.reshape(src_mask.size(0) * src_mask.size(1), src_mask.size(2), src_mask.size(3))
+            
         src = self.encoder(src) * math.sqrt(self.d_model)
         src = self.pos_encoder(src)
         output = self.transformer_encoder(src, src_mask)
@@ -71,7 +77,7 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
-class TransformerEncoderLayer(nn.Module):
+class _TransformerEncoderLayer(nn.Module):
     r"""TransformerEncoderLayer is made up of self-attn and feedforward network.
     This standard encoder layer is based on the paper "Attention Is All You Need".
     Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez,
