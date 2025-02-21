@@ -11,6 +11,7 @@ from tqdm import tqdm
 
 from utils import Settings, Clothes, seed_everything
 from vit import ViT
+from profiler import Profile
 
 
 def get_vit_model() -> torch.nn.Module:
@@ -44,8 +45,8 @@ def get_loaders() -> torch.utils.data.DataLoader:
     print(f"Train Data: {len(train_data)}")
     print(f"Val Data: {len(val_data)}")
 
-    train_loader = DataLoader(dataset=train_data, batch_size=Settings.batch_size, shuffle=True)
-    val_loader = DataLoader(dataset=val_data, batch_size=Settings.batch_size, shuffle=False)
+    train_loader = DataLoader(dataset=train_data, batch_size=Settings.batch_size, shuffle=True, num_workers=20)
+    val_loader = DataLoader(dataset=val_data, batch_size=Settings.batch_size, shuffle=False, num_workers=20)
 
     return train_loader, val_loader
 
@@ -54,27 +55,42 @@ def run_epoch(model, train_loader, val_loader, criterion, optimizer) -> tp.Tuple
     epoch_loss, epoch_accuracy = 0, 0
     val_loss, val_accuracy = 0, 0
     model.train()
-    for data, label in tqdm(train_loader, desc="Train"):
-        data = data.to(Settings.device)
-        label = label.to(Settings.device)
-        output = model(data)
-        loss = criterion(output, label)
-        acc = (output.argmax(dim=1) == label).float().mean()
-        epoch_accuracy += acc.item() / len(train_loader)
-        epoch_loss += loss.item() / len(train_loader)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+
+    with Profile(model, name="vit", schedule={"wait": 1, "warmup": 1, "active": 3}) as profiler:   
+        """
+        schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1)
+            wait=1: The first iteration is ignored to avoid capturing initialization overhead.
+            warmup=1: The second iteration is used to stabilize performance (not recorded).
+            active=3: The next 3 iterations are recorded to capture the performance of the model.
+        
+        """
+
+        for ind, (data, label) in tqdm(enumerate(train_loader), desc="Train"):
+            data = data.to(Settings.device)
+            label = label.to(Settings.device)
+            output = model(data)
+            loss = criterion(output, label)
+            acc = (output.argmax(dim=1) == label).float().mean()
+            epoch_accuracy += acc.item() / len(train_loader)
+            epoch_loss += loss.item() / len(train_loader)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            profiler.step()
 
     model.eval()
-    for data, label in tqdm(val_loader, desc="Val"):
-        data = data.to(Settings.device)
-        label = label.to(Settings.device)
-        output = model(data)
-        loss = criterion(output, label)
-        acc = (output.argmax(dim=1) == label).float().mean()
-        val_accuracy += acc.item() / len(train_loader)
-        val_loss += loss.item() / len(train_loader)
+    with torch.no_grad():
+        for data, label in tqdm(val_loader, desc="Val"):
+            data = data.to(Settings.device)
+            label = label.to(Settings.device)
+            output = model(data)
+            loss = criterion(output, label)
+            acc = (output.argmax(dim=1) == label).float().mean()
+            val_accuracy += acc.item() / len(val_loader)
+            val_loss += loss.item() / len(val_loader)
+
+    profiler.summary()
+    profiler.to_perfetto("trace.json")
 
     return epoch_loss, epoch_accuracy, val_loss, val_accuracy
 
