@@ -18,12 +18,18 @@ def run_sequential(rank, size, num_iter=10):
     Process 2
     ```
     """
-
-    pass
+    
+    for i in range(num_iter):
+        for j in range(size):
+            if rank == j:
+                print(f"Process {j}")
+            dist.barrier()
+        if rank == 0 and i != num_iter - 1:
+            print("---")
 
 
 if __name__ == "__main__":
     local_rank = int(os.environ["LOCAL_RANK"])
     dist.init_process_group(rank=local_rank, backend="gloo")
 
-    run_sequential(local_rank, dist.get_world_size())
+    run_sequential(local_rank, dist.get_world_size(), num_iter=4)
