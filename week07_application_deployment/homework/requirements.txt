@@ -9,3 +9,6 @@ grpcio==1.54.0
 grpcio-tools==1.54.0
 supervisor==4.2.5
 Pillow==9.5.0
+numpy==1.25.2
+pytest
+furl

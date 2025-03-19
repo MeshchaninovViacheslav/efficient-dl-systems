@@ -16,7 +16,6 @@ class InstanceDetectionModel:
         self.model.to(self.device)
         self.model.eval()
 
-        # Transform for the input image
         self.transform = transforms.Compose([
             transforms.ToTensor()
         ])
@@ -26,21 +25,21 @@ class InstanceDetectionModel:
         response = requests.get(image_url)
         if response.status_code != 200:
             raise ValueError(f"Could not download image from {image_url}")
+        print("Downloaded image from {image_url}")
         image_data = response.content
         image = Image.open(BytesIO(image_data)).convert("RGB")
 
-        # Transform and move to device
         x = self.transform(image).to(self.device)
         with torch.no_grad():
-            # Model expects a list of tensors
             predictions = self.model([x])[0]
         
         # Extract labels from predictions
         labels = predictions['labels'].tolist()
+        
         # Convert label indices to category names
         detected_objects = [self.category_names[label] for label in labels]
         
         return detected_objects
 
-# Create a global model instance (or you can lazily load it in each server file)
+
 model = InstanceDetectionModel(score_threshold=0.75)
