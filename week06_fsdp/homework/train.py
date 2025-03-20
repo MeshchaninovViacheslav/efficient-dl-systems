@@ -206,12 +206,12 @@ def train(
     # build tokenizer
     tokenizer_type = model_name_to_tokenizer[model_name]
     tokenizer = build_tokenizer(
-        tokenizer_type, "torchtitan/tests/assets/test_tiktoken.model"
+        tokenizer_type, "../torchtitan/tests/assets/test_tiktoken.model"
     )
     # build dataloader
     data_loader = build_hf_data_loader(
         "c4_test",
-        "torchtitan/tests/assets/c4_test",
+        "../torchtitan/tests/assets/c4_test",
         tokenizer,
         batch_size=batch_size,
         seq_len=seq_len,
@@ -393,7 +393,7 @@ def train(
             if step == 1 or step % log_freq == 0:
                 loss = loss.detach()
                 global_avg_loss = utils.dist_mean(loss, dp_mesh)
-                global_grad_norm = grad_norm.full_tensor().item()
+                global_grad_norm = grad_norm.item()
 
                 time_delta = time.perf_counter() - time_last_log
 
@@ -434,3 +434,15 @@ def train(
 
 if __name__ == "__main__":
     fire.Fire(train)
+
+"""
+torchrun --nproc_per_node=2 --nnodes=1 train.py \
+    --lr=8e-4 --training_steps=10 --batch_size=8 --seq_len=2048 \
+    --model_name=llama3 --flavor=1B --hw_fsdp=True
+"""
+
+"""
+torchrun --nproc_per_node=2 --nnodes=1 train.py \
+    --lr=8e-4 --training_steps=10 --batch_size=8 --seq_len=2048 \
+    --model_name=llama3 --flavor=debugmodel --hw_fsdp=True
+"""

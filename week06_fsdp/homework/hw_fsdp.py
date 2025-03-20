@@ -80,39 +80,29 @@ class FSDPParam:
         shard_rank = self.mesh.get_local_rank()
         shard_world_size = self.mesh.size(0)
         assert param.size(shard_dim) % shard_world_size == 0
-        # TODO: split param into shards, save local shard to `self.sharded_param`
-        # (make sharded param a `DTensor`)
-
+        local_tensor = param.data.chunk(shard_world_size, dim=shard_dim)[shard_rank].clone()
+        local_param = nn.Parameter(local_tensor, requires_grad=param.requires_grad)
+        self.sharded_param = DTensor(local_param, self._sharding_spec, requires_grad=local_param.requires_grad)
         self._setattr_on_module(self.sharded_param)
         self.sharded_state = ShardedState.SHARDED
 
     def _init_dtype_attrs(self, mp_policy: MixedPrecisionPolicy):
         param_dtype, reduce_dtype = (mp_policy.param_dtype, mp_policy.reduce_dtype)
         self.orig_dtype = self.sharded_param.dtype
-        # Clamp `reduce_dtype` to `None` if no casting is required: since
-        # gradients are computed in `param_dtype`, if `reduce_dtype` matches,
-        # then we do not need extra casting
         if reduce_dtype == param_dtype:
             reduce_dtype = None
-        # Clamp `param_dtype` to `None` if no casting is required
         if param_dtype == self.orig_dtype:
             param_dtype = None
         self.param_dtype = param_dtype
         self.reduce_dtype = reduce_dtype
-        # None indicates that the mixed precision is not enabled
 
     def to_sharded(self) -> None:
         self._setattr_on_module(self.sharded_param)
-        # TODO: free unsharded param
         self.sharded_state = ShardedState.SHARDED
 
     def to_unsharded(self) -> None:
-        # Assume that the data has been allocated and all-gathered
-        self._setattr_on_module(self.unsharded_param)
-        self._unsharded_param = nn.Parameter(
-            self.unsharded_param.data,
-            requires_grad=self.unsharded_param.requires_grad,
-        )
+        full_data = self.unsharded_param.data
+        self.sharded_param._local_tensor.data = full_data
         self.sharded_state = ShardedState.UNSHARDED
 
     def _setattr_on_module(self, param: nn.Parameter) -> None:
@@ -121,10 +111,14 @@ class FSDPParam:
         )
 
     @property
-    def unsharded_param(self) -> nn.Parameter:  # ND
+    def unsharded_param(self) -> nn.Parameter:
         if not hasattr(self, "_unsharded_param"):
-            pass
-            # TODO: create unsharded param and save it to `self._unsharded_param`
+            local_shard = self.sharded_param.to_local()
+            world_size = self.mesh.size(0)
+            gathered_shards = [torch.empty_like(local_shard) for _ in range(world_size)]
+            torch.distributed.all_gather(gathered_shards, local_shard)
+            full_param = torch.cat(gathered_shards, dim=self.fsdp_placement.dim)
+            self._unsharded_param = nn.Parameter(full_param, requires_grad=self.sharded_param.requires_grad)
         return self._unsharded_param
 
     def __repr__(self):
@@ -142,15 +136,12 @@ def free_storage(tensor: torch.Tensor) -> None:
         storage.resize_(0)
 
 
-# NOTE: These bypass `nn.Module.__setattr__` checks, which incur non-trivial
-# CPU overhead, if the module did not override it. For FSDP, we know we do not
-# need those checks when transitioning between sharded/unsharded parameters.
 def unsafe_setattr_param(
     module: nn.Module, param_name: str, param: nn.Parameter
 ) -> None:
     if getattr(module.__setattr__, "__func__", None) is nn.Module.__setattr__:
         module._parameters[param_name] = param
-    else:  # slow path
+    else:
         setattr(module, param_name, param)
 
 
@@ -160,8 +151,7 @@ class FSDPCommContext:
         high_priority = -1
         self.all_gather_stream = self.device_handle.Stream(priority=high_priority)
         self.reduce_scatter_stream = self.device_handle.Stream(priority=high_priority)
-        # Post-forward order for explicit backward prefetching
-        self.post_forward_order: List[FSDPModule] = []  # will cause ref cycles
+        self.post_forward_order: List[FSDPModule] = []
 
 
 def fully_shard(
@@ -211,7 +201,6 @@ def fully_shard(
     module._all_gather_event = None
     module._post_reduce_event = None
 
-    # Place FSDP leftmost for highest priority in the method resolution order
     cls = module.__class__
     new_cls = cls_to_fsdp_cls.get(cls, None)
     if not new_cls:
@@ -240,26 +229,22 @@ class FSDPModule:
     _post_reduce_event: Optional[torch.Event]
 
     def __new__(cls, *args, **kwargs):
-        # Use index 2 since 0 is the dynamically constructed `FSDP<...>` class
-        # and index 1 is the `FSDPModule` class itself
         orig_cls = cls.__mro__[2]
         self = orig_cls.__new__(orig_cls, *args, **kwargs)
         self.__init__(*args, **kwargs)
         return self
 
     def unshard(self):
-        if self._all_gather_event is not None:  # already called, pending wait
+        if self._all_gather_event is not None:
             return
         if self.is_unsharded:
-            return  # no-op
+            return
         with record_function(self.with_fqn("FSDP::all_gather")):
-            pass
-            # TODO: allocate unsharded param data
-            # TODO: all-gather sharded params into unsharded params
-
+            for fsdp_param in self.fsdp_params:
+                _ = fsdp_param.unsharded_param
+                fsdp_param._setattr_on_module(fsdp_param.unsharded_param)
+            
     def wait_for_unshard(self):
-        # TODO: wait for all-gather to complete
-        # TODO: set unsharded params on module
         self._to_unsharded()
 
     def reshard(self):
@@ -278,16 +263,12 @@ class FSDPModule:
 
     def _post_backward_final_callback(self) -> None:
         if self.is_unsharded:
-            # Run post-backward in case forward inputs did not require
-            # gradient so the autograd backward did not run
             post_backward(self)
         self._training_state = TrainingState.IDLE
-        # TODO: wait for reduce-scatter to complete
         self._post_forward_indices.clear()
         self.comm_ctx.post_forward_order.clear()
 
     def _backward_prefetch(self) -> None:
-        # TODO (task-3): explicitly prefetch the next module during backward
         pass
 
     @staticmethod
@@ -333,8 +314,6 @@ class FSDPModule:
 
 
 def pre_forward(module: FSDPModule, args: Tuple[Any, ...], kwargs: Dict[str, Any]):
-    # When composing with module-hook-based activation checkpointing, the
-    # the pre-backward hook is responsible for the unshard
     if module._training_state == TrainingState.PRE_BACKWARD:
         return args, kwargs
     logger.debug("%s", module.with_fqn("FSDP::pre_forward"))
@@ -347,8 +326,6 @@ def pre_forward(module: FSDPModule, args: Tuple[Any, ...], kwargs: Dict[str, Any
 
 
 def post_forward(module: FSDPModule, input: Any, output: Any):
-    # When composing with module-hook-based activation checkpointing, the
-    # post-backward hook is responsible for the reshard
     if module._training_state == TrainingState.PRE_BACKWARD:
         return output
     logger.debug("%s", module.with_fqn("FSDP::post_forward"))
@@ -367,9 +344,8 @@ def pre_backward(module: FSDPModule, grad: torch.Tensor):
         return
     with record_function(module.with_fqn("FSDP::pre_backward")):
         module._training_state = TrainingState.PRE_BACKWARD
-        module.unshard()  # no-op if prefetched
+        module.unshard()
         module.wait_for_unshard()
-        # module._backward_prefetch()
     return grad
 
 
@@ -377,11 +353,20 @@ def post_backward(module: FSDPModule):
     logger.debug("%s", module.with_fqn("FSDP::post_backward"))
     module._training_state = TrainingState.POST_BACKWARD
     with record_function(module.with_fqn("FSDP::post_backward_reshard")):
-        module.reshard()
+        for fsdp_param in module.fsdp_params:
+            if fsdp_param._unsharded_param.grad is not None:
+                full_grad = fsdp_param._unsharded_param.grad
+                world_size = fsdp_param.mesh.size(0)
+                grad_chunks = list(
+                    full_grad.chunk(world_size, dim=fsdp_param.fsdp_placement.dim)
+                )
+                reduced_grad = torch.empty_like(grad_chunks[0])
+                torch.distributed.reduce_scatter(reduced_grad, grad_chunks)
+                local_shard = fsdp_param.sharded_param.to_local()
+                local_shard.grad = reduced_grad
+                fsdp_param._unsharded_param.grad = None
     with record_function(module.with_fqn("FSDP::post_backward_reduce")):
         pass
-        # TODO: reduce-scatter unsharded grads into sharded grads
-        # TODO: free unsharded grads
 
 
 def register_pre_backward_hook(hook: Callable, output: Any) -> Any:
@@ -421,7 +406,7 @@ def register_post_backward_hook(
         unsharded_param._is_param = True
         fsdp_param._unsharded_param = cast(nn.Parameter, unsharded_param)
     if len(inp_tensors) == 0:
-        return args, kwargs  # no tensors that require gradients
+        return args, kwargs
     for inp_tensor_idx, inp_tensor in zip(inp_tensor_indices, inp_tensors):
         args_kwargs_list[inp_tensor_idx] = inp_tensor
     args_list = args_kwargs_list[: len(args_list)]
@@ -434,7 +419,6 @@ def register_post_backward_hook(
 class RegisterPostBackwardFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, module: FSDPModule, *inputs: torch.Tensor):
-        # All tensors in `inputs` should require gradient
         ctx.module = module
         return inputs
 
