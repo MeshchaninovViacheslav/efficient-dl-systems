@@ -245,10 +245,52 @@ class FSDPModule:
             return
         with record_function(self.with_fqn("FSDP::all_gather")):
             for fsdp_param in self.fsdp_params:
-                _ = fsdp_param.unsharded_param
-                fsdp_param._setattr_on_module(fsdp_param.unsharded_param)
+                if not hasattr(fsdp_param, "_unsharded_param"):
+                    local_shard = fsdp_param.sharded_param.to_local()
+                    world_size = fsdp_param.mesh.size(0)
+                    shard_dim = fsdp_param.fsdp_placement.dim
+                    
+                    # Calculate full parameter size
+                    unsharded_size = list(local_shard.size())
+                    unsharded_size[shard_dim] = unsharded_size[shard_dim] * world_size
+                    
+                    # Allocate full parameter tensor
+                    full_param = torch.empty(
+                        unsharded_size,
+                        device=local_shard.device,
+                        dtype=fsdp_param.param_dtype or fsdp_param.orig_dtype,
+                        requires_grad=fsdp_param.sharded_param.requires_grad,
+                    )
+                    alloc_storage(full_param)
+                    fsdp_param._unsharded_param = nn.Parameter(
+                        full_param, 
+                        requires_grad=fsdp_param.sharded_param.requires_grad
+                    )
+                
+                # TODO: all-gather sharded params into unsharded params
+                local_shard = fsdp_param.sharded_param.to_local()
+                world_size = fsdp_param.mesh.size(0)
+                full_param = fsdp_param._unsharded_param.data
+                
+                # Using all_gather to collect all shards
+                gathered_shards = [torch.empty_like(local_shard) for _ in range(world_size)]
+                torch.distributed.all_gather(gathered_shards, local_shard)
+                
+                # Concatenate all shards into the full parameter
+                full_param.copy_(torch.cat(gathered_shards, dim=fsdp_param.fsdp_placement.dim))
+                
+                # Set the unsharded parameter on the module
+                fsdp_param._setattr_on_module(fsdp_param._unsharded_param)
             
     def wait_for_unshard(self):
+        """
+        For asynchronous all_gather, wait here. Synchronous is trivially waited.
+        """
+        if self._all_gather_event is not None:
+            if torch.cuda.is_available():
+                self._all_gather_event.synchronize()
+            self._all_gather_event = None
+        # now attach the full param to the module
         self._to_unsharded()
 
     def reshard(self):
@@ -363,20 +405,44 @@ def post_backward(module: FSDPModule):
     logger.debug("%s", module.with_fqn("FSDP::post_backward"))
     module._training_state = TrainingState.POST_BACKWARD
     with record_function(module.with_fqn("FSDP::post_backward_reshard")):
-        for fsdp_param in module.fsdp_params:
-            if fsdp_param._unsharded_param.grad is not None:
-                full_grad = fsdp_param._unsharded_param.grad
-                world_size = fsdp_param.mesh.size(0)
-                grad_chunks = list(
-                    full_grad.chunk(world_size, dim=fsdp_param.fsdp_placement.dim)
-                )
-                reduced_grad = torch.empty_like(grad_chunks[0])
-                torch.distributed.reduce_scatter(reduced_grad, grad_chunks)
-                local_shard = fsdp_param.sharded_param.to_local()
-                local_shard.grad = reduced_grad
-                fsdp_param._unsharded_param.grad = None
+        module.reshard()
+
     with record_function(module.with_fqn("FSDP::post_backward_reduce")):
-        pass
+        """
+        Now that gradients have been computed on the unsharded param,
+        do a reduce_scatter so each rank ends up with just its shard
+        of the gradient. Then we free the unsharded grad memory.
+        """
+        for fsdp_param in module.fsdp_params:
+            world_size = fsdp_param.mesh.size(0)
+            full_grad = fsdp_param.unsharded_param.grad
+            if full_grad is None:
+                continue
+            # Suppose full_grad is shape [N, ...], we chunk along dim=0
+            local_chunk_size = full_grad.size(0) // world_size
+            # We'll scatter into local_shard
+            local_shard = torch.empty(
+                (local_chunk_size,) + full_grad.shape[1:],
+                device=full_grad.device,
+                dtype=fsdp_param.reduce_dtype or (fsdp_param.param_dtype or fsdp_param.orig_dtype),
+            )
+            # reduce_scatter with the per-rank chunk
+            input_list = list(full_grad.chunk(world_size, dim=0))
+            dist.reduce_scatter(local_shard, input_list)
+            # store that shard as the .grad in the DTensor param
+            # so an optimizer can see it
+            fsdp_param.sharded_param.grad = DTensor.from_local(
+                local_shard,
+                fsdp_param._sharding_spec.mesh,
+                fsdp_param._sharding_spec.placements,
+                # size=fsdp_param._sharding_spec.shape,
+            )
+            # free the unsharded gradients
+            free_storage(full_grad)
+            fsdp_param.unsharded_param.grad = None
+
+        if torch.cuda.is_available():
+            module._post_reduce_event = torch.cuda.current_stream().record_event()
 
 
 def register_pre_backward_hook(hook: Callable, output: Any) -> Any:
