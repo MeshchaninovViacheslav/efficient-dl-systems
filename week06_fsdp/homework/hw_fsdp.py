@@ -101,8 +101,12 @@ class FSDPParam:
         self.sharded_state = ShardedState.SHARDED
 
     def to_unsharded(self) -> None:
-        full_data = self.unsharded_param.data
-        self.sharded_param._local_tensor.data = full_data
+        # Assume that the data has been allocated and all-gathered
+        self._setattr_on_module(self.unsharded_param)
+        self._unsharded_param = nn.Parameter(
+            self.unsharded_param.data,
+            requires_grad=self.unsharded_param.requires_grad,
+        )
         self.sharded_state = ShardedState.UNSHARDED
 
     def _setattr_on_module(self, param: nn.Parameter) -> None:
@@ -394,10 +398,7 @@ def register_post_backward_hook(
     for i, obj in enumerate(args_kwargs_list):
         if torch.is_tensor(obj) and obj.requires_grad:
             inp_tensor_indices.append(i)
-            # Create a new tensor that shares the same storage
-            new_tensor = obj.detach().clone()
-            new_tensor.requires_grad_(True)
-            inp_tensors.append(new_tensor)
+            inp_tensors.append(obj)
     
     inp_tensors = RegisterPostBackwardFunction.apply(
         module,
@@ -431,40 +432,25 @@ class RegisterPostBackwardFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, module: FSDPModule, *inputs: torch.Tensor):
         ctx.module = module
-        # Only store the input tensors that need gradients
-        tensors_to_save = []
-        for input_tensor in inputs:
-            tensors_to_save.append(input_tensor)
-        ctx.save_for_backward(*tensors_to_save)
-        # Store the number of module parameters to split inputs correctly later
-        ctx.num_params = len(module.fsdp_params)
-        return inputs
+        return inputs  # simply forward them along
 
     @staticmethod
     def backward(ctx, *grads: torch.Tensor):
-        # Get the module
-        module = ctx.module
-        num_params = ctx.num_params
-        
-        # Split gradients into parameter gradients and input gradients
-        param_grads = grads[:num_params]
-        inp_grads = grads[num_params:]
-        
-        # Process parameter gradients
-        with torch.no_grad():
-            for i, fsdp_param in enumerate(module.fsdp_params):
-                if i < len(param_grads) and param_grads[i] is not None:
-                    param_grad = param_grads[i]
-                    # Accumulate gradients instead of replacing
-                    if hasattr(fsdp_param, '_unsharded_param') and fsdp_param._unsharded_param.grad is None:
-                        fsdp_param._unsharded_param.grad = param_grad.detach().clone()
-                    elif hasattr(fsdp_param, '_unsharded_param'):
-                        fsdp_param._unsharded_param.grad += param_grad.detach().clone()
-        
-        # Call post_backward outside of autograd tracking
-        with torch.no_grad():
-            post_backward(module)
-        
-        # For the backward pass, we need to return gradients for all inputs in the forward function
-        # First None is for the module, then return None for each parameter, then return the actual gradients for inputs
-        return (None,) + (None,) * num_params + inp_grads
+        unsharded_param_grads, inp_grads = (
+            grads[: len(ctx.module.fsdp_params)],
+            grads[len(ctx.module.fsdp_params) :],
+        )
+        for fsdp_param, unsharded_param_grad in zip(
+            ctx.module.fsdp_params, unsharded_param_grads, strict=True
+        ):
+            if unsharded_param_grad is None:
+                raise ValueError(
+                    f"{fsdp_param._param_fqn} got unsharded during forward, but got no gradient after backward."
+                )
+            fsdp_param._unsharded_param.grad = unsharded_param_grad
+        post_backward(ctx.module)
+        return (
+            None,
+            *(None for _ in unsharded_param_grads),
+            *inp_grads,
+        )
