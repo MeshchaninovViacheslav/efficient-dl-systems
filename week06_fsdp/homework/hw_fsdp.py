@@ -267,8 +267,14 @@ class FSDPModule:
 
     def _post_backward_final_callback(self) -> None:
         if self.is_unsharded:
+            # If no grads were needed, post_backward might not have run
             post_backward(self)
         self._training_state = TrainingState.IDLE
+        # If you did asynchronous reduce_scatter, wait here
+        if self._post_reduce_event is not None:
+            if torch.cuda.is_available():
+                self._post_reduce_event.synchronize()
+            self._post_reduce_event = None
         self._post_forward_indices.clear()
         self.comm_ctx.post_forward_order.clear()
 
@@ -432,7 +438,7 @@ class RegisterPostBackwardFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, module: FSDPModule, *inputs: torch.Tensor):
         ctx.module = module
-        return inputs  # simply forward them along
+        return inputs
 
     @staticmethod
     def backward(ctx, *grads: torch.Tensor):
