@@ -3,7 +3,7 @@ import os
 import pickle
 import time
 from functools import partial
-from typing import Optional
+from typing import Optional, Tuple, Any, Dict, List, cast
 
 import fire
 import torch
@@ -438,11 +438,15 @@ if __name__ == "__main__":
 """
 torchrun --nproc_per_node=2 --nnodes=1 train.py \
     --lr=8e-4 --training_steps=10 --batch_size=8 --seq_len=2048 \
-    --model_name=llama3 --flavor=1B --hw_fsdp=True
+    --model_name=llama3 --flavor=1B --hw_fsdp=False \
+    --save_traces_folder=profile_trace-fsdp \
+    --save_memory_snapshot_folder=memory_snapshot-fsdp
 """
 
 """
 torchrun --nproc_per_node=2 --nnodes=1 train.py \
     --lr=8e-4 --training_steps=10 --batch_size=8 --seq_len=2048 \
-    --model_name=llama3 --flavor=debugmodel --hw_fsdp=True
+    --model_name=llama3 --flavor=1B --hw_fsdp=True \
+    --save_traces_folder=profile_trace-custom \
+    --save_memory_snapshot_folder=memory_snapshot-custom
 """
